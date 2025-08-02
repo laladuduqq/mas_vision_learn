@@ -82,7 +82,7 @@ bool HikCamera::openCamera() {
     float gain = 10.0f;
 
     try {
-        cv::FileStorage fs("camera_set.json", cv::FileStorage::READ);
+        cv::FileStorage fs("config/camera_set.json", cv::FileStorage::READ);
         if (!fs.isOpened()) {
             std::cerr << "无法打开 JSON 文件，使用默认值\n";
         } else {
@@ -215,17 +215,48 @@ bool HikCamera::grabImage(cv::Mat& outImg) {
 
     int nRet = MV_CC_GetImageBuffer(handle, &stOutFrame, 1000);
     if (nRet == MV_OK && stOutFrame.pBufAddr) {
-        // 根据像素格式转换为OpenCV Mat
-        if (stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_BayerRG8) {
-            cv::Mat imgRaw(stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nWidth, CV_8UC1, stOutFrame.pBufAddr);
-            cv::cvtColor(imgRaw, outImg, cv::COLOR_BayerRG2BGR);
+        // 优先用海康SDK转换为RGB8
+        if (stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_BayerRG8 ||
+            stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_BayerBG8 ||
+            stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_BayerGB8 ||
+            stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_BayerGR8) {
+
+            // 设置插值方法为均衡
+            MV_CC_SetBayerCvtQuality(handle, 1);
+
+            int width = stOutFrame.stFrameInfo.nWidth;
+            int height = stOutFrame.stFrameInfo.nHeight;
+            int outBufSize = width * height * 3 + 2048;
+            std::vector<unsigned char> rgbBuf(outBufSize);
+
+            MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
+            stConvertParam.nWidth = width;
+            stConvertParam.nHeight = height;
+            stConvertParam.pSrcData = (unsigned char*)stOutFrame.pBufAddr;
+            stConvertParam.nSrcDataLen = stOutFrame.stFrameInfo.nFrameLenEx;
+            stConvertParam.enSrcPixelType = stOutFrame.stFrameInfo.enPixelType;
+            stConvertParam.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
+            stConvertParam.pDstBuffer = rgbBuf.data();
+            stConvertParam.nDstBufferSize = outBufSize;
+
+            nRet = MV_CC_ConvertPixelType(handle, &stConvertParam);
+            if (MV_OK == nRet) {
+                outImg = cv::Mat(height, width, CV_8UC3, rgbBuf.data()).clone();
+                cv::cvtColor(outImg, outImg, cv::COLOR_RGB2BGR); // 关键：RGB转BGR
+            } else {
+                printf("MV_CC_ConvertPixelType fail! nRet [%x]\n", nRet);
+                MV_CC_FreeImageBuffer(handle, &stOutFrame);
+                return false;
+            }
         } else if (stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_RGB8_Packed) {
             outImg = cv::Mat(stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nWidth, CV_8UC3, stOutFrame.pBufAddr).clone();
         } else {
             cv::Mat imgMono(stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nWidth, CV_8UC1, stOutFrame.pBufAddr);
             cv::cvtColor(imgMono, outImg, cv::COLOR_GRAY2BGR);
         }
+
         MV_CC_FreeImageBuffer(handle, &stOutFrame);
+        
         return true;
     } else {
         printf("Get image buffer failed! nRet [0x%x]\n", nRet);
